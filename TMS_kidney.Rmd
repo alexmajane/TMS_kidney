@@ -1,0 +1,1028 @@
+---
+title: "Tabula Muris Senis Kidney Analysis"
+author: "Alex Majane"
+output: html_notebook
+---
+
+<style type="text/css">
+  body{
+  font-size: 12pt;
+}
+</style>
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE, cache = TRUE)
+```
+
+```{r}
+library(Matrix)
+library(DropletUtils)
+library(SoupX)
+library(ggplot2)
+library(cowplot)
+library(tidyverse)
+library(magrittr)
+library(Seurat)
+library(DoubletFinder)
+library(reticulate)
+library(scPred)
+library(SeuratDisk)
+library(speckle)
+library(RColorBrewer)
+library(limma)
+library(MAST)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+
+setwd("~/Documents/Begun/tms_3_and_18m_droplet_kidney/")
+```
+
+## read raw matrices and select cells from empty drops
+
+```{r cache = TRUE}
+read.sc <- function(x) { 
+  mydata <- read10xCounts(paste0(x, "/"))  # read cellranger output
+  mydata
+}
+
+samples <- c("3-M-8",     # sample names
+             "3-M-9",
+             "3-F-57",
+             "18-F-50",
+             "18-F-51",
+             "18-M-52")
+
+sce.list <- sapply(samples, read.sc) # import all six samples and store in a list of Single Cell Experiments
+
+# illegal R characters: translate "-" to "_", and do not start name with a number
+names(sce.list) <- chartr("-", "_", paste0("mo", samples))
+names(sce.list) 
+```
+
+calculate barcode ranks and visualize with waterfall plots:
+```{r}
+br <- lapply(sce.list, barcodeRanks) # function that ranks barcodes by #UMIs
+sapply(br, function(i) {i@metadata}) # show knee and inflection point
+```
+
+```{r fig.width=8, fig.height=6}
+waterfall_plot <- function(s) {
+  br.df <- as.data.frame(s)   
+  br.df %<>% distinct(total, .keep_all = TRUE) # remove redundant datapoints to reduce size that has to go to memory when plotting
+  br.points = data.frame(
+    point = c("knee", "inflection"),
+    val = c(s@metadata$inflection, s@metadata$knee))
+  ggplot(data = br.df, aes(x = rank, y = (total + 1))) +
+    geom_point(size = 0.75) +
+    geom_hline(data = br.points,
+               aes(yintercept = val, colour = point), linetype = 2) +
+    scale_x_log10() +
+    scale_y_log10() +
+    labs(x = "log(barcode rank)", y = "log(UMI counts)") +
+    theme_minimal(base_size = 7)
+}
+
+br.waterfall_plots <- lapply(br, waterfall_plot)
+
+plot_grid(plotlist = br.waterfall_plots, 
+          labels = samples, 
+          label_size = 7) # plot all six samples
+```
+
+use the EmptyDrops algorithm to predict putative cells:
+```{r cache = TRUE}
+set.seed(8)
+ed.out <- sapply(sce.list, function(i) { emptyDrops(i, lower = 200) }) # requiring at least 200 UMI
+
+# filter to cells with FDR of 0.01
+cells <- lapply(ed.out, function(i) { which(i$FDR <= 0.01) } )
+
+#subset SCEs with cell indices
+sce.filtered.list <- mapply(function(x, y) { x[,y] },
+                            sce.list, cells)
+```
+
+```{r fig.width=8, fig.height=6}
+# take a look at waterfall plots for the cells predicted by EmptyDrops
+br.filtered <- lapply(sce.filtered.list, barcodeRanks)
+br.filtered.waterfall_plots <- lapply(br.filtered, waterfall_plot)
+plot_grid(plotlist = br.filtered.waterfall_plots, 
+          labels = samples, 
+          label_size = 7) # plot all six samples
+```
+
+EmptyDrops predicts that many of the barcodes below the knee are real cells based on their transcriptome. This can be useful when trying to mazimize the number of cells captured, but many of these might be low quality cells / fractions of cells / nuclei. We can filter these out later with a hard UMI cutoff around the knee point of ~1000 UMI.
+
+```{r cache=TRUE}
+## export filtered data
+dir.create("filtered")
+lapply(names(sce.filtered.list), # create directory for each filtered sample
+       function(i) {
+       dir.create(file.path("filtered", i)) } )
+
+# now write in 10X format
+mapply(function(x, y) {
+         writeMM(counts(x), file = file.path("filtered", y, "matrix.mtx"))  # sparse matrix
+         write_lines(x$Barcode, file = file.path("filtered", y, "barcodes.tsv")) # barcode file
+         write.table(as.data.frame(rowData(x)), # genes file
+                     file = file.path("filtered", y, "genes.tsv"), 
+                     sep = "\t", col.names = FALSE, row.names = FALSE, quote = FALSE)
+       },
+       sce.filtered.list,
+       names(sce.filtered.list)
+)
+
+# remove these data now 
+rm(sce.list, sce.filtered.list, ed.out, br, br.filtered)
+```
+
+## read filtered matrices and perform QC
+prior to batch-correction and integration I do QC on each sample seperately.
+
+reading in the sparse matrices of filtered cells:
+```{r cache=TRUE}
+read.sc <- function(x) {
+  mydata <- readMM(paste0(x, "/matrix.mtx"))
+  features <- read.table(paste0(x, "/genes.tsv"), header = FALSE)
+  barcodes <- read.table(paste0(x, "/barcodes.tsv"), header = FALSE)
+  dimnames(mydata) <- list(features$V2, barcodes$V1) # rownames are gene symbols and colnames are barcodes
+  mydata
+}
+
+setwd("~/Documents/Begun/tms_3_and_18m_droplet_kidney/filtered/") # filtered cells dir
+
+samples <- c("mo3_M_8", # sample names are updated to strings that work with R
+             "mo3_M_9",
+             "mo3_F_57",
+             "mo18_F_50",
+             "mo18_F_51",
+             "mo18_M_52")
+
+filt.mats <- lapply(samples, read.sc) # reading in filtered matrices to a list
+names(filt.mats) <- samples
+```
+
+initiate seurat objects from each of six gene X cell matrices:
+```{r cache=TRUE}
+so.list <- lapply(filt.mats, function(i) {
+                    CreateSeuratObject(counts = i, 
+                                       min.cells = 10, # keep only genes expressed in at least 10 cells
+                                       project = "kidney")
+              }
+        )
+
+rm(filt.mats) # don't need the matrices anymore
+```
+**QC based on mitochondrial gene %, number of UMIs, number of features.** 
+```{r}
+# mtDNA
+so.list <- lapply(so.list, function(i) {
+              i$percent.mt <- PercentageFeatureSet(i, pattern = "^mt-")
+              i
+            }
+          )
+```
+
+```{r fig.height=20, fig.width=6}
+## look at dist of mtDNA, nUMI, nFeatures
+QC.vln.plots <- lapply(so.list, function(data) { 
+                        VlnPlot(data,
+                        features = c("nFeature_RNA", "nCount_RNA", "percent.mt")) & 
+                        theme(axis.title.x = element_blank(), axis.text.x = element_blank())
+                      }
+                    )
+plot_grid(plotlist = QC.vln.plots, ncol = 1, labels = samples)
+#QC.vln.plots[1]
+#QC.vln.plots[2]
+#QC.vln.plots[3]
+#QC.vln.plots[4]
+#QC.vln.plots[5]
+#QC.vln.plots[6]
+```
+
+```{r}
+# plot % mitochondrial counts vs total counts per cell
+QC.mitoscatter.plots <- lapply(so.list, function(data) { 
+                                FeatureScatter(data,
+                                feature2 = "percent.mt", 
+                                feature1 = "nCount_RNA",
+                                pt.size = 0.5, cols = "black",) & 
+                                theme_minimal(base_size = 8) & 
+                                theme(legend.position = "none") &
+                                labs(title = NULL)
+                              }
+                            )
+
+plot_grid(plotlist = QC.mitoscatter.plots, labels = samples, label_size = 10)
+```
+
+see the expected trend of high mito% cells also having lower counts, but this 
+is not strictly true. Next step is to apply a reasonable cutoff, based on these distributions but also a priori knowledge. typically we would choose ~10% mitochondrial counts. However, this data does have a high percentage of mitochondrial counts so that would remove many cells. # apply some reasonable upper cutoffs based on these distributions and plot again. Also it seems the kidney expresses
+a lot of mt genes and exclusion criteria is somewhat contested: 30 - 50%: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6940381/
+
+based on this 40% seems reasonable:
+```{r}
+so.list.mitofilter <- lapply(so.list, function(i) {
+                      subset(i, percent.mt < 40)  # subset to cells with < 40% mito counts
+                }
+              )
+# what fraction of barcodes did we remove?
+mapply(function(before, after) { 
+        (dim(before)[2] - dim(after)[2]) / dim(before)[2] 
+      },
+      so.list, so.list.mitofilter
+    )
+```
+
+**filter by UMIs and features**
+note that emptydrops finds a lot of low UMI barcodes it thinks are cells,
+but they could also be are nuclei / cellular debris. for a conservative analysis using high quality cells with a hard cutoff may be more prudent
+```{r}
+so.list.cutoff <- lapply(so.list.mitofilter, function(i) {
+                          subset(i, nCount_RNA < 30000 & nCount_RNA > 1200)
+                        }
+                      )
+
+# what fraction of barcodes did we remove?
+mapply(function(before, after) { 
+          (dim(before)[2] - dim(after)[2]) / dim(before)[2] 
+          },
+        so.list.mitofilter, so.list.cutoff
+      )
+```
+plot QC data again:
+```{r fig.height=20, fig.width=6}
+QC.vln.plots <- lapply(so.list.cutoff, function(data) { 
+                        VlnPlot(data,
+                        features = c("nFeature_RNA", "nCount_RNA", "percent.mt")) & 
+                        theme(axis.title.x = element_blank(), axis.text.x = element_blank())
+                      }
+                    )
+plot_grid(plotlist = QC.vln.plots, ncol = 1, labels = samples)
+```
+
+remove unfiltered data now
+```{r}
+rm(so.list, so.list.mitofilter)
+```
+
+## data normalization 
+
+normalize the data using the SCTransform method. this uses a regularized 
+negative binomial regression to estimate regularized parameters for different
+groups of genes. method outperforms using a single scale factor for all genes: https://genomebiology.biomedcentral.com/articles/10.1186/s13059-019-1874-1
+
+```{r}
+so.list.cutoff <- lapply(so.list.cutoff, function(i) { 
+                                          SCTransform(i, 
+                                          vars.to.regress = "percent.mt", # regressing normalization against mitochondrial count percent
+                                          method = "glmGamPoi",
+                                          verbose = FALSE)
+                                        }
+                                      )
+```
+
+## preliminary dimensionality reduction
+
+doing dim reduction and clustering on each sample before batch correction. THis is to make sure the data looks ok and this will help visualize doublets later
+
+```{r fig.dim=c(7,5)}
+# run PCA and decide how many PCs to use for clustering and UMAP
+so.list.cutoff <- lapply(so.list.cutoff,
+                         function(i) { i %>% RunPCA() })
+
+elbowplots <- lapply(so.list.cutoff, function(i) { 
+                          ElbowPlot(i, ndims = 40, reduction = "pca") + 
+                          theme_minimal(base_size = 8)
+                        }
+                      )
+plot_grid(plotlist = elbowplots, labels = samples, label_size = 8)
+```
+
+explained variance looks very small after PC 26
+```{r}
+PCs <- 1:26
+```
+
+continue with SNN graph construction, UMAP, Leiden clustering
+```{r results='hide'}
+#reticulate::virtualenv_create() # to use leiden alg: must go through reticulate to use python in R
+
+#py_install("leidenalg")
+
+so.list.cutoff <- lapply(so.list.cutoff,
+                         function(i) {
+                           i %>% 
+                             FindNeighbors(dims = PCs) %>%  # make SNN graph
+                             RunUMAP(dims = PCs) %>%        # perform UMAP
+                             FindClusters(algorithm = "leiden") # do clustering with Leiden algorithm
+                         })
+```
+
+check the most variable features among samples for general overlap:
+```{r}
+top20 <- lapply(so.list.cutoff, function(i) { head(VariableFeatures(i), 20) }) # top 20 variable features
+knitr::kable(as.data.frame(do.call(cbind, top20)), format = "markdown")
+```
+
+plot variance against average gene expression:
+```{r fig.width=7, fig.height=15}
+VF.plots <- lapply(so.list.cutoff, function(i) {
+                                         VariableFeaturePlot(i, pt.size = 0.5, 
+                                                             selection.method = "sct") +
+                                         theme_minimal(base_size = 8)
+                                       }
+                                    )
+
+options(ggrepel.max.overlaps = Inf)
+
+VF.plots.labs <- mapply(function(vf, labels) {
+                        LabelPoints(plot = vf, 
+                                    points = labels, 
+                                    repel = TRUE,
+                                    xnudge = 0,
+                                    ynudge = 0)
+                      },
+                   VF.plots, top20, SIMPLIFY = FALSE
+                  )
+
+plot_grid(plotlist = VF.plots.labs, ncol = 1, labels = samples)
+```
+
+## preliminary dim reduction / clustering visualization
+
+this is to make sure the data doesn't look out of the ordinary on per-sample basis. we will use these clusters to do doublet detection.
+```{r}
+# this function adjusts alpha (transparency) of points in ggplot objects
+adjust.alpha <- function(plot, a) { 
+                    plot[[1]]$layers[[1]]$aes_params$alpha <- a 
+                    plot
+                   }
+```
+
+```{r fig.width=8.5, fig.height=5.5}
+# PC1 vs PC2
+PCA.12.plots <- lapply(so.list.cutoff, function(i) {
+                       DimPlot(object = i, dims = c(1,2), reduction = "pca") +
+                       theme_minimal(base_size = 8)
+                      }
+                    )
+
+PCA.12.plots <- lapply(PCA.12.plots, adjust.alpha, a = 0.7)
+plot_grid(plotlist = PCA.12.plots, labels = samples)
+```
+
+```{r fig.width=8.5, fig.height=5.5}
+# PC1 vs PC3
+PCA.13.plots <- lapply(so.list.cutoff, function(i) {
+                       DimPlot(object = i, dims = c(1,3), reduction = "pca") +
+                       theme_minimal(base_size = 8)
+                      }
+                    )
+
+PCA.13.plots <- lapply(PCA.13.plots, adjust.alpha, a = 0.7)
+plot_grid(plotlist = PCA.13.plots, labels = samples)
+```
+
+```{r fig.width=8.5, fig.height=5.5}
+# UMAP
+umap.plots <- lapply(so.list.cutoff, function(i) {
+                     DimPlot(object = i, reduction = "umap", pt.size = 0.75) +
+                     theme_minimal(base_size = 8)
+                      }
+                    )
+
+umap.plots <- lapply(umap.plots, adjust.alpha, a = 0.7)
+plot_grid(plotlist = umap.plots, labels = samples)
+```
+
+Sanity check with some marker genes from Tabula Muris
+
+**Acta2** (mesangial cells):
+```{r fig.width=8.5, fig.height=5.5}
+Acta2.plots <- lapply(so.list.cutoff, function(i) {
+                     FeaturePlot(object = i, features = "Acta2", reduction = "umap") +
+                     theme_minimal(base_size = 8) +
+                     theme(title = element_blank())
+                    }
+                   )
+plot_grid(plotlist = Acta2.plots, labels = samples)
+```
+
+**Emcn** (capillary endothelium):
+```{r fig.width=8.5, fig.height=5.5}
+Emcn.plots <- lapply(so.list.cutoff, function(i) {
+  FeaturePlot(object = i, features = "Emcn", reduction = "umap") +
+    theme_minimal(base_size = 8) +
+    theme(title = element_blank())
+}
+)
+plot_grid(plotlist = Emcn.plots, labels = samples)
+```
+
+**Emr1** (macrophage):
+```{r fig.width=8.5, fig.height=5.5}
+Emr1.plots <- lapply(so.list.cutoff, function(i) {
+  FeaturePlot(object = i, features = "Adgre1", reduction = "umap") +
+    theme_minimal(base_size = 8) +
+    theme(title = element_blank())
+}
+)
+plot_grid(plotlist = Emr1.plots, labels = samples)
+```
+
+
+## Doublet prediction
+
+I'm using DoubletFinder which is compares real cells to simulated doublet transcriptomes. Here I am ignoring homotypic doublets- for this basic overview it is probably not going to impact results.
+
+In a real-world application with more time I would try to estimate homotypic doublet
+rates from ground-truth cell-type proportions to ID those candidates as well 
+
+estimate of doublet rate from Tabula Muris paper- 
+"Cells were loaded in each channel with a target output of 5,000 cells per sample"
+at 5,000 cells expected doublet rate is ~2.4%
+
+perform parameter sweeping of pK (neighborhood size) with range of vals for pN (number artificial doublets)
+```{r return=FALSE}
+sweep.res.list <- lapply(so.list.cutoff, # parameter sweeping neighborhood size
+                         function(i) {
+                           paramSweep_v3(i, PCs = PCs, sct = TRUE)
+                         }
+                        )
+
+sweep.stats <- lapply(sweep.res.list,  # get summary of parameter sweeps. ROC analysis
+                      function(i) {
+                        summarizeSweep(i, GT = FALSE)
+                      }
+                    )
+bcmvn <- lapply(sweep.stats, find.pK) # get AUC in ROC analysis for each pK
+
+pKmax <- lapply(bcmvn, function(i) { i[which.max(i$BCmetric),]$pK } ) # get the max pK
+pKmax <- as_vector(type.convert(pKmax, as.is = TRUE))
+```
+
+looking at our pK values that maximize AUC
+```{r}
+print(pKmax)
+```
+
+
+expecting 2.4% doublets based on 10X guide and 5000 cells loaded
+```{r}
+nExp <- lapply(so.list.cutoff, function(i) { round(ncol(i) * 0.024) })
+```
+
+run doubletfinder:
+```{r return = FALSE}
+# for each sample, using individual pKmax and constant doublet rate
+so.filtered <- mapply(function(obj, pKm, exp_doub) {
+                        doubletFinder_v3(seu = obj, 
+                                         pN = 0.25, 
+                                         pK = pKm, 
+                                         nExp = as.numeric(exp_doub), 
+                                         PCs = PCs,
+                                         sct = TRUE)
+                              },
+                        so.list.cutoff, pKmax, nExp
+                      )
+```
+
+visualize doublet properties. We expect doublets to have a higher number of features than average.
+
+```{r fig.width=5, fig.height=20}
+# name of the DF prediction is different depending on parameters, so extract the correct column name for each sample.
+DF.name = lapply(so.filtered, function(i) {
+      colnames(i@meta.data)[grepl("DF.classification", colnames(i@meta.data))] 
+                        }
+  )
+
+dblt.vln <- mapply(function(obj, prediction) {
+                    VlnPlot(obj, 
+                            features = c("nFeature_RNA", "nCount_RNA"),
+                            group.by = prediction, 
+                            pt.size = 0.2)
+                      },
+                   so.filtered, DF.name,
+                   SIMPLIFY = FALSE
+                   )
+plot_grid(plotlist = dblt.vln, ncol = 1, labels = samples, label_x = -.05)
+```
+
+```{r fig.width=8, fig.height=11}
+dblt.umap <- mapply(function(obj, prediction) {
+                        DimPlot(obj,
+                                group.by = prediction, 
+                                pt.size = 0.4, 
+                                reduction = "umap",
+                                order = "Doublet") + 
+                        labs(title = element_blank())
+                      },
+                      so.filtered, DF.name,
+                      SIMPLIFY = FALSE
+                      )
+
+plot_grid(plotlist = dblt.umap, ncol = 2, labels= samples)
+```
+
+not seeing a clear trend of greater counts and features in doublets. this is not required of a doublet but expect see a trend. A biological explanation would be that some cell types could express many more features than others. With more time this would be an area that I would want to troubleshoot
+
+remove doublets:
+```{r}
+so.nodb <- mapply(function(obj, prediction) {
+              obj[, obj@meta.data[, prediction] == "Singlet"] # select barcodes predicted to be singlets
+             },
+            so.filtered, DF.name, 
+            SIMPLIFY = FALSE
+)
+```
+
+## batch correction and data integration
+
+batch correction using Comprehensive Integration Algorithm (Stuart et al 2019), canonical correlation analysis is used to capture features that correlate among batches, then mutual nearest neighbors are found to make a graph of all samples
+
+prepare the data:
+```{r}
+# add names to each sample dataset
+so.nodb <- mapply(function(x, y) {
+                         AddMetaData(object = x,
+                                     metadata = y,
+                                     col.name = "sample")
+                            },
+                      so.nodb, samples,
+                      SIMPLIFY = FALSE
+                    )
+
+# add age and sex information
+so.nodb$mo3_M_8   %<>% AddMetaData(metadata = "3",  col.name = "age")
+so.nodb$mo3_M_9   %<>% AddMetaData(metadata = "3",  col.name = "age")
+so.nodb$mo3_F_57  %<>% AddMetaData(metadata = "3",  col.name = "age")
+so.nodb$mo18_F_50 %<>% AddMetaData(metadata = "18", col.name = "age")
+so.nodb$mo18_F_51 %<>% AddMetaData(metadata = "18", col.name = "age")
+so.nodb$mo18_M_52 %<>% AddMetaData(metadata = "18", col.name = "age")
+so.nodb$mo3_M_8   %<>% AddMetaData(metadata = "M",  col.name = "sex")
+so.nodb$mo3_M_9   %<>% AddMetaData(metadata = "M",  col.name = "sex")
+so.nodb$mo3_F_57  %<>% AddMetaData(metadata = "F",  col.name = "sex")
+so.nodb$mo18_F_50 %<>% AddMetaData(metadata = "F",  col.name = "sex")
+so.nodb$mo18_F_51 %<>% AddMetaData(metadata = "F",  col.name = "sex")
+so.nodb$mo18_M_52 %<>% AddMetaData(metadata = "M",  col.name = "sex")
+```
+
+identify the shared variable features among datasets and specifically prepare to use integration with SCTransform method
+```{r}
+shared.var.features <- SelectIntegrationFeatures(object.list = so.nodb, nfeatures = 3000)
+so.nodb %<>% PrepSCTIntegration(anchor.features = shared.var.features, 
+                                verbose = FALSE)
+```
+
+identify integration anchors and integrate the data
+```{r return=FALSE}
+anchors <- FindIntegrationAnchors(object.list = so.nodb, 
+                                  normalization.method = "SCT", 
+                                  anchor.features = shared.var.features, verbose = FALSE)
+kidney.integrated <- IntegrateData(anchorset = anchors, 
+                                   normalization.method = "SCT", verbose = FALSE)
+```
+
+remove some big objects we no longer need
+```{r return=FALSE}
+rm(anchors, so.list.cutoff, so.filtered, so.list.mitofilter, so.list, sweep.res.list)
+```
+
+now analyze combined dataset
+```{r}
+DefaultAssay(kidney.integrated) <- "integrated" # this just sets the default slot in the seurat object to be the integrated data rather than un-corrected data
+```
+
+## dimensionality reduction and clustering of integrated data
+the counts data is already normalized and batch-corrected from the upstream
+processing. however now that we have all samples combine we will need to re-run PCA, 
+make a new SNN graph, find clusters and perform UMAP again
+
+PCA:
+```{r}
+kidney.integrated %<>% RunPCA()
+kidney.integrated %>% ElbowPlot(ndims = 40, reduction = "pca")
+```
+
+PC27 looks like a good break point
+```{r}
+PCs = 1:27
+```
+
+plot PCA:
+```{r fig.width = 7, fig.height= 3.3}
+PCA.12.plot <- DimPlot(kidney.integrated, # PC1 vs PC2
+                       dims = c(1,2), 
+                       reduction = "pca", 
+                       group.by = "age", 
+                       shuffle = TRUE,
+                       pt.size = 0.3) +
+                       theme(plot.title = element_blank(),
+                             text = element_text(size = 11)) +
+                       labs(color = "age (mo)") #%>% adjust.alpha(a = 0.8)
+PCA.13.plot <- DimPlot(kidney.integrated,
+                       dims = c(1,3), 
+                       reduction = "pca", 
+                       group.by = "age",
+                       shuffle = TRUE,
+                       pt.size = 0.3) +
+                       theme(plot.title = element_blank(),
+                             text = element_text(size = 11))+
+                       labs(color = "age (mo)")#%>% adjust.alpha(a = 0.8)
+PCA.12.plot %<>% adjust.alpha(a = 0.8)
+PCA.13.plot %<>% adjust.alpha(a = 0.8)
+plot_grid(PCA.12.plot, PCA.13.plot)
+```
+
+create shared nearest neighbor graph:
+```{r}
+kidney.integrated %<>% FindNeighbors(reduction = "pca", dims = PCs)
+```
+
+do Leiden clustering at a series of resolutions:
+```{r}
+kidney.integrated %<>% FindClusters(
+                          algorithm = "leiden",
+                          resolution = seq(0.2,1.4,0.1),
+                          verbose = FALSE)
+print(sapply(
+        grep("res", colnames(kidney.integrated@meta.data), value = TRUE),
+        function(i) { length(unique(kidney.integrated@meta.data[,i])) }
+        )
+) # show the number of clusters at the various resolutions
+```
+
+based on the tabula muris senis annotation we expect around 18 cell types total.
+choose resolution that gives 19 clusters, they can be merged later on.
+```{r}
+Idents(kidney.integrated) <- "integrated_snn_res.0.4" # assigning res with19 clusters
+```
+
+Do UMAP. using 20 nearest neighbors to get better local structure, which is helpful for resolving similar cell types
+```{r return = FALSE}
+kidney.integrated %<>% RunUMAP(reduction = "pca",
+                               dims = PCs,       # running UMAP on PCs 1-27
+                               n.neighbors = 20, 
+                               verbose = FALSE)
+```
+
+```{r fig.width=5.5, fig.height=12}
+p1 <- DimPlot(kidney.integrated,  #plot 1: color points by sample
+              reduction = "umap", 
+              group.by = "sample", 
+              pt.size = 0.2, 
+              shuffle = T) +
+            scale_color_brewer(palette = "Dark2") + 
+                theme(plot.title = element_blank(), 
+                      axis.title.x = element_text(size = 9),
+                      axis.title.y = element_text(size = 9), 
+                      legend.text = element_text(size = 9),
+                      axis.text = element_text(size = 9))
+
+p2 <- DimPlot(kidney.integrated,   # plot 2: color points by age
+              reduction = "umap", 
+              group.by = "age", 
+              pt.size = 0.2, 
+              shuffle = T) +
+                theme(plot.title = element_blank(), 
+                      axis.title.x = element_text(size = 9),
+                      axis.title.y = element_text(size = 9), 
+                      legend.text = element_text(size = 9),
+                      axis.text = element_text(size = 9))
+
+p3 <- DimPlot(kidney.integrated,   # plot 3: color points by leiden clusters (stored as 'ident' in seurat object)
+              reduction = "umap", 
+              group.by = 'ident',
+              pt.size = 0.2,
+              shuffle = TRUE) + 
+                theme(plot.title = element_blank(), 
+                                   axis.title.x = element_text(size = 9),
+                                   axis.title.y = element_text(size = 9),
+                                   legend.text = element_text(size = 9),
+                                   axis.text = element_text(size = 9)) 
+
+p1 %<>% adjust.alpha(a = 0.7) # adjust alpha for each plot
+p2 %<>% adjust.alpha(a = 0.7)
+p3 %<>% adjust.alpha(a = 0.9)
+
+plot_grid(p1, p2, p3, labels = c('sample', 'age', 'leiden clusters'), ncol = 1)
+```
+
+so we can see that there is concordant clustering among batches into shared clusters, with some differences breaking down by condition (expected!)
+
+## annotate cell types
+
+I was hoping to annotate automatically by training a model on some of the other ages of TMS data, but I ran into trouble converting the Anndata python format into a format that is useable in R:
+```{r}
+# first i create a conda environment locally then:
+#reticulate::use_condaenv("anndata") # python via reticulate
+#ad <- reticulate::import("anndata", convert = FALSE) # importing anndata python class
+#kidney_ad <- ad$read_h5ad("tabula-muris-senis-droplet-processed-official-annotations-Kidney.h5ad")
+#kidney.tms <- Convert(kidney_ad, to = "seurat")
+```
+
+unfortunately cannot get reticulate to work as expected here.
+
+Instead I annotated manually by comparing marker genes of my clusters to expression in the TMS cellxgene browser.
+
+The first step is to find cell type markers that define clusters (conserved across ages and samples) using wilcox rank sum tests. to find the top markers, I required that markers have logfoldchange >= 0.25, and defined by presence (positive markers) rather than absence (negative markers). this process compares expression in each cluster to expression across all other clusters, i.e. clust_i vs (all - clust_i):
+
+```{r}
+# the function below replaces the individually transformed values for each batch with a # single sequencing depth covariate.
+
+#kidney.integrated %<>% PrepSCTFindMarkers()
+
+markers_all <- FindAllMarkers(      # clust_i vs (all - clust_i) wilcox rank sum test
+  object = kidney.integrated,
+  only.pos = TRUE,  
+  logfc.threshold = 0.25, verbose = FALSE
+)
+
+dim(markers_all)[1] # how many markers?
+```
+
+get top 15 markers for each cluster:
+```{r return=FALSE}
+top5 <- lapply(unique(markers_all$cluster),
+                function(i) {
+                head(subset(markers_all, cluster == i), n=5)
+              }
+            )
+# here is an example:
+print(top5[1])
+```
+
+I compared marker expression in this dataset with the TMS in cellxgene. here is an example of visualization of brush cell markers:
+```{r}
+DefaultAssay(kidney.integrated) <- 'RNA' # the RNA slot holds un-transformed values that better capture differences among cell types
+kidney.integrated %>% VlnPlot('Mep1a') # example brush cell marker
+```
+
+now assign all markers. I collapsed some clusters together and wasn't able to call every
+cell in the TMS data.
+
+```{r}
+kidney.integrated %<>% RenameIdents("1" = "brush_cell",
+                                    "2" = "brush_cell",
+                                    "3" = "proximal_tubule_cell",
+                                    "4" = "fenestrated_cell",
+                                    "5" = "proximal_tubule_cell",
+                                    "6" = "distal_convoluted_tubule_cell",
+                                    "7" = "thin_LOH",
+                                    "8" = "thick_LOH",
+                                    "9" = "macrophage",
+                                    "10" = "proximal_tubule_cell",
+                                    "11" = "fibroblast",
+                                    "12" = "T_cell",
+                                    "13" = "collecting_duct_principal_cell",
+                                    "14" = "NK_cell",
+                                    "15" = "podocyte",
+                                    "16" = "B_cell",
+                                    "17" = "capillary_endothelial_cell",
+                                    "18" = "distal_convoluted_tubule_cell",
+                                    "19" = "mesangial_cell")
+
+
+```
+
+plot UMAP again with cell type annotation:
+
+```{r fig.width=8, fig.height=5}
+mycols <- colorRampPalette(brewer.pal(12, "Paired"))(15) # expanding this palette from 12 to 15 colors
+
+pUMAP <- DimPlot(kidney.integrated, 
+              reduction = "umap", 
+              pt.size = 0.2,
+              shuffle = TRUE) + 
+  scale_color_manual(values = mycols) +
+  theme(plot.title = element_blank(), 
+        axis.title.x = element_text(size = 9),
+        axis.title.y = element_text(size = 9),
+        legend.text = element_text(size = 9),
+        axis.text = element_text(size = 9)) %>% adjust.alpha(a = 0.9)
+
+pUMAP
+```
+
+## changes in cell type composition with age
+
+plot cell type ratios per sample:
+```{r fig.width=8, fig.height=5}
+celltypeXsample <- as.data.frame(table(Idents(kidney.integrated), # gather up number of each cell type per sample
+                                       kidney.integrated$sample)) %>% 
+                                          setNames(c("cell_type", "sample", "counts"))
+
+celltypeXsample$sample <- factor(celltypeXsample$sample, levels = samples) # order the sample names
+
+celltype_abund_plot <- ggplot(celltypeXsample, aes(sample, counts, fill = cell_type)) + 
+                           geom_bar(position="fill", stat="identity") + # position = 'fill' normalizes scale of each sample
+                           scale_fill_manual(values = mycols) +
+                           theme_minimal(base_size =  11) +
+                           labs(y = "relative abundance",
+                                fill = "cell type") +
+                           theme(axis.title.x = element_blank()) 
+
+celltype_abund_plot
+```
+
+for a statistical test of abundances across age we need a two-sample test that can account for sex as a random variable. the package speckle/propeller. does a moderated t-test on transformed proportional data and is very easy to apply to a seurat object. https://www.biorxiv.org/content/10.1101/2021.11.28.470236v1.full
+
+```{r}
+kidney.integrated$celltype <- Idents(kidney.integrated)
+
+# transformed cell type proportions: 
+props <- speckle::getTransformedProps(kidney.integrated$celltype,
+                                      kidney.integrated$sample,
+                                      transform = 'logit')
+# make a design matrix that accounts for age and sex:
+age <- c(rep('18', 3), rep('3', 3))
+sex <- c("M", "M", "F", "F", "F", "M")
+data.frame(age, sex)
+design <- model.matrix(~ 0 + age + sex)
+mycontr <- makeContrasts(age18-age3, levels=design)
+mycontr # contrasts age with sex as a random effect
+```
+
+implement empirical bayes moderated ttest. here a fraction >1 indicates more of that cell type in age 18:
+```{r rows.print = 15}
+print(propeller.ttest(prop.list = props,
+                         design = design,
+                         robust = TRUE,
+                         trend = FALSE,
+                         sort = TRUE, 
+                         contrasts = mycontr))
+```
+
+we can see that natural killer cells and thin loop of henle are differently abundant with a significant p value but the FDR is 11% and 36% respectively. so no differences we can confident in when accounting for multiple testing. Additionally we can see that there are many more T and B cells in 18 month old mice, but these differences are not significant either - likely because these cells are rare and have less power to detect differences.
+
+## differential expression
+ 
+perform DE analysis on age among the two biggest clusters. these clusters are proximal tubule cells and brush cells:
+```{r}
+table(Idents(kidney.integrated))
+```
+
+create a new data class that has both cell type and age information:
+```{r}
+kidney.integrated$celltype.age <- paste(kidney.integrated$celltype, 
+                                        kidney.integrated$age,
+                                           sep = "_")
+Idents(kidney.integrated) <- "celltype.age"
+```
+
+we can conveniently implement MAST for sc DE from Seurat::FindMarkers()
+```{r}
+kidney.PTC.MAST <- kidney.integrated %>% 
+                        FindMarkers(assay = "SCT", 
+                                    slot = "data",
+                                    ident.1 = "proximal_tubule_cell_18", 
+                                    ident.2 = "proximal_tubule_cell_3",
+                                    test.use = "MAST",
+                                    logfc.threshold = 0.1,
+                                    verbose = FALSE) %>% 
+                                      subset(p_val_adj < 0.05) %>% # keep only significantly DE genes
+                                        mutate(abs.LFC = abs(avg_log2FC)) # calculate absolute value of expression difference
+
+kidney.BC.MAST <- kidney.integrated %>% 
+                      FindMarkers(assay = "SCT", 
+                                  slot = "data",
+                                  ident.1 = "brush_cell_18", 
+                                  ident.2 = "brush_cell_3",
+                                  test.use = "MAST",
+                                  logfc.threshold = 0.1,
+                                  verbose = FALSE) %>% 
+                                    subset(p_val_adj < 0.05) %>% 
+                                        mutate(abs.LFC = abs(avg_log2FC))
+
+# how many significant DE genes?
+cat(paste0(dim(kidney.PTC.MAST)[1], " DE genes in PTC\n", 
+             dim(kidney.BC.MAST)[1], " DE genes in BC"))
+```
+
+observe the top 15 DE genes (ordered by absolute log2FC) for each cell type.
+A positive log2FC indicates greater expression in age 18mo vs 3mo
+```{r rows.print = 15}
+top15.PTC <- head(kidney.PTC.MAST[order(kidney.PTC.MAST$abs.LFC, decreasing = TRUE), ], n = 15)
+top15.BC <- head(kidney.BC.MAST[order(kidney.BC.MAST$abs.LFC, decreasing = TRUE), ], n = 15)
+```
+
+top 15 DE in proximal tubule cells:
+```{r}
+top15.PTC
+```
+
+top 15 DE in brush cells:
+```{r}
+top15.BC
+```
+
+how much overlap is there between the significantly DE genes in these cells
+```{r}
+shared.DE <- rownames(kidney.BC.MAST)[rownames(kidney.BC.MAST) %in% rownames(kidney.PTC.MAST)]
+length(shared.DE)
+```
+
+93 genes in common. makes sense as these are very similar cell types!
+
+visualize a few of the top DE genes:
+
+```{r}
+# we need to normalize the count data in the RNA slot for DE visualization
+kidney.integrated %<>% NormalizeData(assay = "RNA")
+```
+
+```{r fig.width=8.5, fig.height=16}
+PTC.DE.vln <- VlnPlot(kidney.integrated,
+                      assay = "RNA",
+                      slot = "data",
+                      features= head(rownames(top15.PTC)),
+                      idents = c("proximal_tubule_cell_3", "proximal_tubule_cell_18")) &
+                        theme(axis.title.x = element_blank())
+BC.DE.vln <- VlnPlot(kidney.integrated,
+                     assay = "RNA",
+                     slot = "data",
+                     features= head(rownames(top15.BC)),
+                     idents = c("brush_cell_3", "brush_cell_18")) &
+                        theme(axis.title.x = element_blank())
+
+plot_grid(PTC.DE.vln, BC.DE.vln, ncol = 1)
+```
+
+
+## pathway analysis of DE genes
+
+we can use package clusterProfiler to do pathway enrichment against online KEGG database
+```{r}
+search_kegg_organism('mmu', by='kegg_code')
+```
+
+prepare gene lists for enrichment analysis. we need to convert gene symbols to entrez IDs to search KEGG
+```{r}
+# DE gene lists
+PTC.genelist <- rownames(kidney.PTC.MAST)
+BC.genelist <- rownames(kidney.BC.MAST)
+
+# background gene lists (all genes expressed in focal cell type)
+Idents(kidney.integrated) <- "celltype"
+
+PTC.totalcounts <- rowSums(subset(kidney.integrated, idents = "proximal_tubule_cell")@assays$RNA@counts)
+PTC.background <- names(PTC.totalcounts[PTC.totalcounts > 100]) # define 'expressed' as > 100 total counts per gene
+BC.totalcounts <- rowSums(subset(kidney.integrated, idents = "brush_cell")@assays$RNA@counts)
+BC.background <- names(BC.totalcounts[BC.totalcounts > 100]) # define 'expressed' as > 100 total counts per gene
+
+# first convert to ensembl IDs using the genes.tsv data supplied for this assignment. 
+# we get a few more matches to entrez going from ensembl rather than gene symbols.
+mouse_genes <- read.table("3-M-8/genes.tsv") 
+
+# match symbols in gene lists to the symbol+ensembl table
+PTC.genelist <- left_join(data.frame(PTC.genelist), mouse_genes, by = c("PTC.genelist" = "V2"))
+BC.genelist <- left_join(data.frame(BC.genelist), mouse_genes, by = c("BC.genelist" = "V2"))
+PTC.background <- left_join(data.frame(PTC.background), mouse_genes, by = c("PTC.background" = "V2"))
+BC.background <- left_join(data.frame(BC.background), mouse_genes, by = c("BC.background" = "V2"))
+
+# now get entrez IDs from ensembl IDs
+IDs <- lapply(list(PTC.genelist, 
+                    BC.genelist, 
+                    PTC.background, 
+                    BC.background), 
+               function(i) {select(org.Mm.eg.db,   # this searches the ncbi mouse gene database and returns gene aliases
+                            keys = unlist(lapply(str_split(i$V1, '\\.'), function(x) x[1])),
+                            columns = c("ENTREZID", "ENSEMBL", "SYMBOL"), # return entrez, ensembl, and gene symbol
+                            keytype = "ENSEMBL") # searching with ensembl IDs
+               }
+)
+
+# and now list the entrez ids that were found (excluding the NAs that couldnt be found in the database)
+PTC.genelist.entrez <- data.frame(IDs[1])$ENTREZID[!is.na(data.frame(IDs[1])$ENTREZID)]
+BC.genelist.entrez <- data.frame(IDs[2])$ENTREZID[!is.na(data.frame(IDs[2])$ENTREZID)]
+PTC.background.entrez <- data.frame(IDs[3])$ENTREZID[!is.na(data.frame(IDs[3])$ENTREZID)]
+BC.background.entrez <- data.frame(IDs[4])$ENTREZID[!is.na(data.frame(IDs[4])$ENTREZID)]
+```
+
+now search the KEGG database for significant pathway enrichment in proximal tubule cell DE genes:
+```{r}
+PTC.kegg <- enrichKEGG(gene = PTC.genelist.entrez,
+                       universe = PTC.background.entrez,
+                       organism  = 'mmu',
+                       pvalueCutoff = 0.05)
+```
+
+and brush cell DE genes:
+```{r}
+BC.kegg <- enrichKEGG(gene = BC.genelist.entrez,
+                       universe = BC.background.entrez,
+                       organism  = 'mmu',
+                       pvalueCutoff = 0.05)
+```
+
+results for proximal tubule cell pathways:
+```{r cols.print = 10}
+print.data.frame(head(PTC.kegg))
+```
+
+and brush cells:
+```{r}
+print.data.frame(head(BC.kegg))
+```
+
